@@ -35,7 +35,7 @@ export async function embedQuery(text: string): Promise<number[]> {
 // Flash for chat responses
 export async function generateResponse(prompt: string): Promise<string> {
   const response = await ai.models.generateContent({
-    model: "gemini-2.0-flash",
+    model: "gemini-2.5-flash-lite",
     contents: prompt,
   });
   return response.text!;
@@ -44,7 +44,7 @@ export async function generateResponse(prompt: string): Promise<string> {
 // Image description via Vision
 export async function describeImage(imageBase64: string, mimeType: string): Promise<string> {
   const response = await ai.models.generateContent({
-    model: "gemini-2.0-flash",
+    model: "gemini-2.5-flash-lite",
     contents: [
       {
         parts: [

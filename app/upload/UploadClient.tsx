@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect, useRef } from "react";
 import Navbar from "@/components/Navbar";
 import UploadZone from "@/components/UploadZone";
 
@@ -23,25 +23,63 @@ function getFileType(filename: string): string {
 }
 
 export default function UploadClient() {
+  const [existingProjects, setExistingProjects] = useState<string[]>([]);
   const [project, setProject] = useState("");
+  const [newProject, setNewProject] = useState("");
+  const [showNewInput, setShowNewInput] = useState(false);
   const [uploads, setUploads] = useState<UploadRecord[]>([]);
   const [successMsg, setSuccessMsg] = useState("");
+  const newInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    fetch("/api/projects")
+      .then((r) => r.json())
+      .then((data) => {
+        setExistingProjects(data.projects ?? []);
+        if ((data.projects ?? []).length === 0) setShowNewInput(true);
+      })
+      .catch(() => setShowNewInput(true));
+  }, []);
+
+  useEffect(() => {
+    if (showNewInput) newInputRef.current?.focus();
+  }, [showNewInput]);
+
+  const activeProject = showNewInput ? newProject.trim() : project;
+
+  function handleSelect(e: React.ChangeEvent<HTMLSelectElement>) {
+    const val = e.target.value;
+    if (val === "__new__") {
+      setShowNewInput(true);
+      setProject("");
+    } else {
+      setShowNewInput(false);
+      setProject(val);
+    }
+  }
 
   function handleSuccess(filename: string, chunks: number) {
     const record: UploadRecord = {
       filename,
       type: getFileType(filename),
-      project: project.trim() || "general",
+      project: activeProject || "general",
       chunks,
-      date: new Date().toLocaleDateString("en-GB", {
-        day: "2-digit",
-        month: "short",
-        year: "numeric",
-      }),
+      date: new Date().toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" }),
     };
     setUploads((prev) => [record, ...prev]);
-    setSuccessMsg(`${filename} — ${chunks} chunks stored`);
-    setTimeout(() => setSuccessMsg(""), 4000);
+
+    // Re-fetch the full project list from Pinecone so all namespaces appear
+    fetch("/api/projects")
+      .then((r) => r.json())
+      .then((data) => {
+        const fetched: string[] = data.projects ?? [];
+        setExistingProjects(fetched);
+        if (fetched.length > 0) setShowNewInput(false);
+      })
+      .catch(() => {});
+
+    setSuccessMsg(`${filename} — ${chunks} chunks stored in "${record.project}"`);
+    setTimeout(() => setSuccessMsg(""), 5000);
   }
 
   return (
@@ -52,26 +90,51 @@ export default function UploadClient() {
         <div>
           <h1 className="text-2xl font-bold text-white">Upload Documents</h1>
           <p className="text-gray-400 text-sm mt-1">
-            Add files to your knowledge base. Tag them with a project so you can filter later.
+            Tag each file with a project so they go into the right namespace.
           </p>
         </div>
 
-        {/* Project tag */}
-        <div>
-          <label className="block text-sm text-gray-400 mb-2">
-            Project tag <span className="text-gray-600">(required before uploading)</span>
-          </label>
-          <input
-            type="text"
-            value={project}
-            onChange={(e) => setProject(e.target.value)}
-            placeholder="e.g. PowerProx, thesis, hotel-tech"
-            className="w-full px-4 py-3 rounded-lg bg-gray-800 border border-gray-700 text-white placeholder-gray-500 focus:outline-none focus:border-blue-500 transition text-sm"
-          />
+        {/* Project selector */}
+        <div className="space-y-3">
+          <label className="block text-sm text-gray-400">Project</label>
+
+          {existingProjects.length > 0 && (
+            <select
+              value={showNewInput ? "__new__" : project}
+              onChange={handleSelect}
+              className="w-full px-4 py-3 rounded-lg bg-gray-800 border border-gray-700 text-white focus:outline-none focus:border-blue-500 transition text-sm"
+            >
+              <option value="" disabled>Select a project…</option>
+              {existingProjects.map((p) => (
+                <option key={p} value={p}>{p}</option>
+              ))}
+              <option value="__new__">+ New project…</option>
+            </select>
+          )}
+
+          {showNewInput && (
+            <input
+              ref={newInputRef}
+              type="text"
+              value={newProject}
+              onChange={(e) => setNewProject(e.target.value)}
+              placeholder="Enter new project name…"
+              className="w-full px-4 py-3 rounded-lg bg-gray-800 border border-blue-500 text-white placeholder-gray-500 focus:outline-none transition text-sm"
+            />
+          )}
+
+          {showNewInput && existingProjects.length > 0 && (
+            <button
+              onClick={() => { setShowNewInput(false); setNewProject(""); }}
+              className="text-xs text-gray-500 hover:text-gray-300 transition"
+            >
+              ← Back to existing projects
+            </button>
+          )}
         </div>
 
         {/* Upload zone */}
-        <UploadZone project={project} onSuccess={handleSuccess} />
+        <UploadZone project={activeProject} onSuccess={handleSuccess} />
 
         {/* Success banner */}
         {successMsg && (
@@ -86,9 +149,7 @@ export default function UploadClient() {
         {/* Recent uploads table */}
         {uploads.length > 0 && (
           <div>
-            <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-3">
-              Recent Uploads
-            </h2>
+            <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-3">Recent Uploads</h2>
             <div className="rounded-xl border border-gray-800 overflow-hidden">
               <table className="w-full text-sm">
                 <thead>
@@ -102,20 +163,13 @@ export default function UploadClient() {
                 </thead>
                 <tbody>
                   {uploads.map((u, i) => (
-                    <tr
-                      key={i}
-                      className="border-b border-gray-800 last:border-0 hover:bg-gray-900/50 transition"
-                    >
-                      <td className="px-4 py-3 text-white truncate max-w-[200px]">{u.filename}</td>
+                    <tr key={i} className="border-b border-gray-800 last:border-0 hover:bg-gray-900/50 transition">
+                      <td className="px-4 py-3 text-white truncate max-w-[180px]">{u.filename}</td>
                       <td className="px-4 py-3">
-                        <span className="bg-gray-800 text-gray-300 text-xs px-2 py-1 rounded-full">
-                          {u.type}
-                        </span>
+                        <span className="bg-gray-800 text-gray-300 text-xs px-2 py-1 rounded-full">{u.type}</span>
                       </td>
                       <td className="px-4 py-3">
-                        <span className="bg-blue-950 text-blue-300 text-xs px-2 py-1 rounded-full">
-                          {u.project}
-                        </span>
+                        <span className="bg-blue-950 text-blue-300 text-xs px-2 py-1 rounded-full">{u.project}</span>
                       </td>
                       <td className="px-4 py-3 text-right text-gray-300">{u.chunks}</td>
                       <td className="px-4 py-3 text-right text-gray-500">{u.date}</td>
@@ -127,10 +181,7 @@ export default function UploadClient() {
           </div>
         )}
 
-        {/* Accepted formats */}
-        <p className="text-xs text-gray-600">
-          Accepted: PDF, DOCX, TXT, MD, PNG, JPG, JPEG, PY, JS, TS
-        </p>
+        <p className="text-xs text-gray-600">Accepted: PDF, DOCX, TXT, MD, PNG, JPG, JPEG, PY, JS, TS</p>
       </main>
     </div>
   );

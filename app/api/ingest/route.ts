@@ -1,7 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import { v4 as uuidv4 } from "uuid";
+import type { PineconeRecord } from "@pinecone-database/pinecone";
 import { embedText } from "@/lib/gemini";
-import { getPineconeIndex } from "@/lib/pinecone";
+import { getPineconeNamespace } from "@/lib/pinecone";
 import { chunkText } from "@/lib/chunker";
 import { parsePdf } from "@/lib/parsers/pdf";
 import { parseDocx } from "@/lib/parsers/docx";
@@ -23,35 +24,26 @@ async function extractText(
   filename: string,
   type: VectorMetadata["type"]
 ): Promise<{ text: string; imageDesc?: string }> {
-  if (type === "pdf") {
-    return { text: await parsePdf(buffer) };
-  }
-  if (type === "docx") {
-    return { text: await parseDocx(buffer) };
-  }
+  if (type === "pdf") return { text: await parsePdf(buffer) };
+  if (type === "docx") return { text: await parseDocx(buffer) };
   if (type === "image") {
     const mimeMap: Record<string, string> = {
-      png: "image/png",
-      jpg: "image/jpeg",
-      jpeg: "image/jpeg",
-      webp: "image/webp",
+      png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", webp: "image/webp",
     };
     const ext = filename.split(".").pop()?.toLowerCase() ?? "jpg";
-    const mimeType = mimeMap[ext] ?? "image/jpeg";
-    const desc = await parseImage(buffer, mimeType);
+    const desc = await parseImage(buffer, mimeMap[ext] ?? "image/jpeg");
     return { text: desc, imageDesc: desc };
   }
   return { text: await parseText(buffer) };
 }
 
-// Pinecone free tier limit: upsert in batches of 100
 async function upsertInBatches(
-  index: ReturnType<typeof getPineconeIndex>,
-  vectors: { id: string; values: number[]; metadata: Record<string, unknown> }[]
+  ns: ReturnType<typeof getPineconeNamespace>,
+  vectors: PineconeRecord[]
 ) {
   const BATCH_SIZE = 100;
   for (let i = 0; i < vectors.length; i += BATCH_SIZE) {
-    await index.upsert(vectors.slice(i, i + BATCH_SIZE));
+    await ns.upsert(vectors.slice(i, i + BATCH_SIZE));
   }
 }
 
@@ -68,7 +60,6 @@ export async function POST(req: NextRequest) {
     const filename = file.name;
     const type = getFileType(filename);
     const buffer = Buffer.from(await file.arrayBuffer());
-
     const { text, imageDesc } = await extractText(buffer, filename, type);
 
     if (!text || text.trim().length === 0) {
@@ -79,29 +70,25 @@ export async function POST(req: NextRequest) {
     const uploadedAt = new Date().toISOString();
     const docId = uuidv4();
 
-    // Embed chunks sequentially — batch API returns undefined values for some chunks
-    const vectors: { id: string; values: number[]; metadata: Record<string, unknown> }[] = [];
+    const vectors: PineconeRecord[] = [];
     for (let i = 0; i < chunks.length; i++) {
       const values = await embedText(chunks[i]);
-      const metadata: Record<string, unknown> = {
+      const metadata: PineconeRecord["metadata"] = {
         text: chunks[i],
         source: filename,
         type,
         project,
         uploadedAt,
       };
-      if (imageDesc) metadata.imageDesc = imageDesc;
+      if (imageDesc) metadata!.imageDesc = imageDesc;
       vectors.push({ id: `${docId}-${i}`, values, metadata });
     }
 
-    const index = getPineconeIndex();
-    await upsertInBatches(index, vectors);
+    // Upsert into the project's own namespace
+    const ns = getPineconeNamespace(project);
+    await upsertInBatches(ns, vectors);
 
-    return NextResponse.json({
-      chunksStored: vectors.length,
-      filename,
-      project,
-    });
+    return NextResponse.json({ chunksStored: vectors.length, filename, project });
   } catch (err) {
     console.error("[ingest] error:", err);
     const message = err instanceof Error ? err.message : "Unknown error";
