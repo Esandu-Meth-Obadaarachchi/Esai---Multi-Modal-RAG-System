@@ -1,7 +1,7 @@
 import { DynamicStructuredTool } from "@langchain/core/tools";
 import { z } from "zod";
-import { queryPinecone } from "@/lib/pinecone";
-import { embedQuery } from "@/lib/gemini";
+import { queryPinecone, listProjects } from "@/lib/pinecone";
+import { embedQuery, generateResponse } from "@/lib/gemini";
 import type { VectorMetadata } from "@/types";
 
 export type TaskType =
@@ -13,285 +13,203 @@ export type TaskType =
   | "research"
   | "unknown";
 
-export const CLARIFYING_QUESTIONS: Record<TaskType, string[]> = {
-  feature: [
-    "Which project is this for?",
-    "Which files or components will this touch?",
-    "What should happen when it fails or the user does something unexpected?",
-    "Are there any existing patterns in the codebase this must match?",
-  ],
-  bugfix: [
-    "What did you expect to happen?",
-    "What actually happened?",
-    "Paste the full error message.",
-    "Paste the code or file path where the error occurs.",
-    "When did this start? Did anything change before it broke?",
-  ],
-  architecture: [
-    "What are the specific options you are choosing between?",
-    "What are your hard constraints — budget, timeline, team size?",
-    "What do you prioritise most: speed of development, performance, cost or maintainability?",
-    "What is the consequence of getting this decision wrong?",
-  ],
-  review: [
-    "Which project and file is this from?",
-    "What is the code supposed to do?",
-    "What is your biggest concern about it?",
-    "Is this going to production or is it a prototype?",
-  ],
-  docs: [
-    "Who is the audience — other engineers, junior devs or external users?",
-    "What format do you need — README, inline JSDoc or API reference?",
-    "What is the most confusing part that must be explained well?",
-  ],
-  research: [
-    "What are the two or three options you are comparing?",
-    "What is your most important constraint — cost, performance, ease of use?",
-    "Which project will this decision affect?",
-  ],
-  unknown: [
-    "What are you trying to achieve in one sentence?",
-    "Which project is this related to?",
-    "What should the output look like — code, explanation, a decision, documentation?",
-  ],
-};
-
-const ROLE_BY_TASK: Record<TaskType, string> = {
-  feature:
-    "You are a senior full-stack engineer with 10 years of experience in Next.js 14, TypeScript, LangChain.js and Pinecone. You write production-grade code with no shortcuts, no placeholder comments and explicit error handling on every async function.",
-  bugfix:
-    "You are a senior debugging engineer. You identify root causes, not symptoms. You fix the actual problem, not just the error message. You never guess — if you are uncertain, you say so and explain how to confirm the root cause.",
-  architecture:
-    "You are a principal software architect with experience shipping production AI systems. You think in trade-offs, not absolutes. You make concrete recommendations and do not give balanced non-answers.",
-  review:
-    "You are a senior engineer doing a rigorous code review. You care about correctness, security, performance and maintainability. You are direct. You do not soften criticism. You prioritise issues by severity.",
-  docs:
-    "You are a technical writer who has worked at Stripe and Vercel. You write documentation that is precise, scannable and never wastes the reader's time. You write for engineers, not beginners.",
-  research:
-    "You are a technical researcher who gives direct, opinionated recommendations based on specific constraints. You do not hedge. You do not give generic information available on Wikipedia. You give the answer specific to the given constraints.",
-  unknown:
-    "You are a senior software engineer and AI systems architect. You answer technical questions with precision, directness and specific actionable output.",
-};
-
-const OUTPUT_FORMAT_BY_TASK: Record<TaskType, string> = {
-  feature: `For each file changed:
-FILE: [path]
-[complete file content]
-
-Then:
-ENVIRONMENT VARIABLES NEEDED: [list or "none"]
-THINGS TO MANUALLY TEST: [numbered list]
-POTENTIAL ISSUES TO WATCH: [list]`,
-
-  bugfix: `ROOT CAUSE: [one paragraph — the actual cause, not the symptom]
-FIX: [corrected code only, with file path]
-WHY THIS WORKS: [one sentence]
-RELATED RISKS: [anything else this change might affect]
-HOW TO VERIFY THE FIX: [one test step]`,
-
-  architecture: `RECOMMENDATION: [one sentence — pick one option]
-WHY: [3 bullet points maximum]
-TRADE-OFFS I AM ACCEPTING: [what is being given up]
-HOW TO IMPLEMENT IT: [5-step numbered implementation path]
-WHEN TO REVISIT THIS DECISION: [trigger condition]`,
-
-  review: `CRITICAL (must fix before shipping): [numbered list]
-MAJOR (should fix soon): [numbered list]
-MINOR (nice to fix): [numbered list]
-GOOD (what is done well — keep this): [list]
-REVISED CODE: [rewrite only sections with critical or major issues, with file paths]`,
-
-  docs: `## [Component / Function Name]
-### What it does
-### When to use it
-### Parameters / Props [table format]
-### Example usage [code block]
-### Edge cases and gotchas`,
-
-  research: `WINNER FOR MY USE CASE: [one answer, no hedging]
-COMPARISON TABLE: [feature | option A | option B — 5 rows max]
-WHY THE LOSER LOSES FOR MY CASE: [one paragraph]
-MIGRATION PATH IF I SWITCH LATER: [brief, 3 steps]
-FINAL RECOMMENDATION: [one direct paragraph]`,
-
-  unknown: `ANSWER: [direct response]
-CODE OR ACTION: [if applicable]
-NEXT STEPS: [numbered list]`,
-};
-
 export function detectTaskType(input: string): TaskType {
   const lower = input.toLowerCase();
-
   if (/build|implement|add|create|feature|integrate/.test(lower)) return "feature";
   if (/bug|error|fix|broken|crash|not working|failing/.test(lower)) return "bugfix";
   if (/architecture|design|decide|choose|\bvs\b|versus|which/.test(lower)) return "architecture";
   if (/review|check|audit|improve|refactor/.test(lower)) return "review";
   if (/document|docs|readme|comment|explain this code/.test(lower)) return "docs";
   if (/compare|research|difference|pros and cons/.test(lower)) return "research";
-
   return "unknown";
 }
 
-function scorePrompt(sections: {
-  role: string;
-  context: string;
-  task: string;
-  constraints: string[];
-  outputFormat: string;
-}): number {
-  let score = 0;
-  if (sections.role.length > 50) score += 1;
-  if (sections.context.length > 100) score += 2;
-  if (sections.task.length > 20 && sections.task.length < 300) score += 2;
-  if (sections.constraints.length >= 3) score += 2;
-  if (sections.outputFormat.length > 50) score += 1;
-  score += 2; // chain of thought + XML tags always included
-  return score;
+// Ask Gemini what's actually missing from this specific request
+export async function generateClarifyingQuestions(
+  rawInput: string,
+  taskType: string
+): Promise<string[]> {
+  const prompt = `You are helping build an optimised prompt for Claude Code — an AI coding assistant that already has access to the project's CLAUDE.md file, which contains the full architecture, tech stack, file structure, and design decisions.
+
+The developer wants to: "${rawInput}"
+Task type detected: ${taskType}
+
+Think carefully about what specific information is MISSING from this request to write a complete, actionable Claude prompt.
+
+Rules:
+- Claude already has CLAUDE.md, so do NOT ask about things like the tech stack, file structure, or project architecture — those are already documented
+- Only ask what's truly necessary for THIS specific request
+- Do not ask about things already stated or implied in the request
+- If the request is self-contained enough, return fewer questions or none at all
+- Maximum 3 questions
+- Make questions concrete and specific to this request — not generic checklist items
+
+Return ONLY a valid JSON array of question strings.
+If no clarification is needed, return: []
+
+Examples of good questions:
+- "What should happen when the upload fails midway — silent fail, show an error, or retry?"
+- "Should this new button replace the existing one or appear alongside it?"
+- "Paste the exact error message you are seeing."
+
+Examples of bad questions (do not ask these):
+- "Which project is this for?" (ask this only if the project is genuinely ambiguous and not inferable)
+- "What tech stack are you using?" (already in CLAUDE.md)
+- "What files will this touch?" (Claude can figure this out from context)
+
+Return only the JSON array, nothing else.`;
+
+  try {
+    const response = await generateResponse(prompt);
+    const match = response.match(/\[[\s\S]*?\]/);
+    if (match) return JSON.parse(match[0]) as string[];
+    return [];
+  } catch {
+    return [];
+  }
 }
 
-function assemblePrompt(
-  taskType: TaskType,
-  context: string,
-  task: string,
-  constraints: string[],
-  clarifications: Record<string, string>,
-  retrievedSources: string[]
-): string {
-  const role = ROLE_BY_TASK[taskType];
-  const outputFormat = OUTPUT_FORMAT_BY_TASK[taskType];
+// Match the user's project mention against actual Pinecone namespaces (case-insensitive)
+async function resolveProject(
+  rawInput: string,
+  answers: Record<string, string>,
+  explicitFilter?: string
+): Promise<string | undefined> {
+  const allProjects = await listProjects();
+  if (allProjects.length === 0) return undefined;
 
-  const constraintBlock =
-    constraints.length > 0
-      ? constraints.map((c) => `- ${c}`).join("\n")
-      : "- Match the existing code style exactly\n- Handle all error cases explicitly\n- Do not add unnecessary abstractions";
+  // 1. Explicit project filter field takes priority
+  if (explicitFilter?.trim()) {
+    const match = allProjects.find(
+      (p) => p.toLowerCase() === explicitFilter.trim().toLowerCase()
+    );
+    if (match) return match;
+  }
 
-  const clarificationBlock = Object.entries(clarifications)
-    .map(([q, a]) => `Q: ${q}\nA: ${a}`)
-    .join("\n\n");
+  // 2. Scan all answers + raw input for any known project name
+  const allText = [...Object.values(answers), rawInput].join(" ").toLowerCase();
+  for (const project of allProjects) {
+    if (allText.includes(project.toLowerCase())) return project;
+  }
 
-  const score = scorePrompt({ role, context, task, constraints, outputFormat });
+  return undefined; // will fall back to querying all namespaces
+}
 
-  const separator = "─".repeat(48);
+// Use Gemini to write an actual specific prompt — not fill a template
+async function generatePromptWithGemini(
+  rawInput: string,
+  taskType: string,
+  answers: Record<string, string>,
+  retrievedContext: string
+): Promise<string> {
+  const answersBlock =
+    Object.keys(answers).length > 0
+      ? Object.entries(answers)
+          .map(([q, a]) => `${q}\n→ ${a}`)
+          .join("\n\n")
+      : "No additional answers provided.";
 
-  const esaiNotes = [
-    `Confidence score: ${score}/10`,
-    `Context retrieved from: ${retrievedSources.join(", ") || "general knowledge base"}`,
-    score < 8
-      ? "WARNING: Prompt scored below 8/10. Consider adding more specific constraints."
-      : "Prompt quality is good. Paste directly into Claude.",
-    "If Claude's answer does not match expectations, reply with: 'That is not quite right. The specific issue is [X]. Try again with this constraint: [Y]'",
-  ];
+  const prompt = `You are an expert at writing prompts for Claude Code — an AI coding assistant with full terminal, file read/write, and bash access.
 
-  const prompt = `<role>
-${role}
-</role>
+The developer wants to do this:
+"${rawInput}"
 
-<project_context>
-${context}
+Task type: ${taskType}
 
-Additional context from your answers:
-${clarificationBlock}
-</project_context>
+They answered these clarifying questions:
+${answersBlock}
 
-<task>
-${task}
-</task>
+Here is relevant code, architecture, and patterns retrieved from the project's knowledge base:
+---
+${retrievedContext}
+---
 
-<constraints>
-${constraintBlock}
-- Use TypeScript with strict mode. No any types.
-- Use async/await. Never .then() chains or callbacks.
-- Handle errors with try/catch on every async function.
-- Match the existing file naming conventions: kebab-case files, PascalCase components, camelCase functions.
-</constraints>
+Write a complete, specific, immediately-usable prompt for Claude Code.
 
-<output_format>
-${outputFormat}
-</output_format>
+Requirements:
+- Reference the actual file paths, function names, and code patterns visible in the retrieved context above — make it specific, not generic
+- Claude already has the project's CLAUDE.md file open — do not repeat what is documented there. Instead write "Claude Code has CLAUDE.md open — refer to it for the full stack and design decisions" in the context section
+- The prompt must be specific enough that Claude does not need to ask any follow-up questions
+- Derive constraints from what you can see in the retrieved code patterns (naming conventions, error handling style, existing patterns to match)
+- For a feature request: name the exact files to modify and describe what the change must integrate with
+- For a bug: identify the likely cause from the retrieved context and point to exactly where to fix it
+- Use XML tags for structure: <task>, <context>, <constraints>, <output_format>
+- End with: "Think through the approach in 2 sentences before writing any code. Then implement."
 
-Before writing your answer, think through the approach in 3 sentences. Identify any edge cases or risks. Then produce the output.
+Write only the prompt. No preamble. No "here is your prompt". Just the prompt itself, starting with <task>.`;
 
-Verify your output satisfies all constraints before responding. If it does not, fix it first.`;
-
-  return `${separator}
-ESAI GENERATED PROMPT
-Task Type: ${taskType.toUpperCase()}
-${esaiNotes.join("\n")}
-${separator}
-
-${prompt}
-
-${separator}
-ESAI NOTES — do not paste into Claude:
-${esaiNotes.slice(1).map((n) => `• ${n}`).join("\n")}
-• Follow-up prompts you will likely need:
-  1. "Now write tests for the code you just wrote."
-  2. "What edge cases did you not handle in that solution?"
-  3. "Refactor that to be more concise without losing functionality."
-${separator}`;
+  return generateResponse(prompt);
 }
 
 export const buildPromptTool = new DynamicStructuredTool({
   name: "build_prompt",
   description:
-    "Builds an optimised, context-rich prompt to paste into Claude. Use when the user wants help generating a Claude prompt for a coding task, bug fix, architecture decision, code review, documentation or research.",
+    "Builds an optimised, context-rich prompt to paste into Claude Code. Retrieves real project context from the knowledge base and uses Gemini to write a specific, actionable prompt.",
   schema: z.object({
     rawInput: z.string().describe("The user's rough description of what they want to do"),
-    clarifications: z.record(z.string()).optional().describe("Answers to clarifying questions, keyed by question text"),
-    projectFilter: z.string().optional().describe("Project name to filter context retrieval"),
-    additionalConstraints: z.array(z.string()).optional().describe("Extra constraints the user mentioned"),
+    clarifications: z
+      .record(z.string())
+      .optional()
+      .describe("Answers to clarifying questions, keyed by question text"),
+    projectFilter: z
+      .string()
+      .optional()
+      .describe("Project name from the filter input field"),
+    additionalConstraints: z
+      .array(z.string())
+      .optional()
+      .describe("Extra constraints the user mentioned"),
   }),
 
   func: async ({ rawInput, clarifications = {}, projectFilter, additionalConstraints = [] }) => {
     try {
       const taskType = detectTaskType(rawInput);
-      const requiredQuestions = CLARIFYING_QUESTIONS[taskType];
-      const answeredQuestions = Object.keys(clarifications);
-      const unansweredQuestions = requiredQuestions.filter(
-        (q) => !answeredQuestions.some((a) => a.toLowerCase().includes(q.toLowerCase().slice(0, 20)))
-      );
 
-      if (unansweredQuestions.length > 0 && answeredQuestions.length === 0) {
-        return JSON.stringify({
-          status: "needs_clarification",
-          taskType,
-          questions: unansweredQuestions,
-          message: `Detected task type: ${taskType}. Answer these questions to build the prompt:`,
-        });
-      }
+      // Resolve actual Pinecone namespace from answers + raw input + explicit filter
+      const resolvedProject = await resolveProject(rawInput, clarifications, projectFilter);
 
-      const queryText = projectFilter ? `${projectFilter} ${rawInput}` : rawInput;
+      // Build query: combine raw input with any additional constraints for better retrieval
+      const queryText = [rawInput, ...additionalConstraints].join(" ");
       const queryVector = await embedQuery(queryText);
-      const { matches } = await queryPinecone(queryVector, 6, projectFilter);
+      const { matches } = await queryPinecone(queryVector, 8, resolvedProject);
 
-      const retrievedContext = (matches ?? [])
-        .map((m) => {
-          const meta = m.metadata as unknown as VectorMetadata;
-          return `[Source: ${meta.source} | Project: ${meta.project} | Type: ${meta.type}]\n${meta.text}`;
-        })
-        .join("\n\n---\n\n");
+      const retrievedContext =
+        (matches ?? []).length > 0
+          ? (matches ?? [])
+              .map((m) => {
+                const meta = m.metadata as unknown as VectorMetadata;
+                return `[${meta.source} | ${meta.project} | ${meta.type}]\n${meta.text}`;
+              })
+              .join("\n\n---\n\n")
+          : "No specific project context found in the knowledge base.";
 
       const allSources = (matches ?? []).map((m) => {
         const meta = m.metadata as unknown as VectorMetadata;
         return meta.source ?? "unknown";
       });
-      const retrievedSources = Array.from(new Set(allSources));
+      const sourcesUsed = Array.from(new Set(allSources));
 
-      const contextBlock =
-        retrievedContext.length > 0
-          ? `Project Knowledge Retrieved:\n\n${retrievedContext}`
-          : "No specific project context found. Using general engineering knowledge.";
-
-      const prompt = assemblePrompt(
-        taskType,
-        contextBlock,
+      const prompt = await generatePromptWithGemini(
         rawInput,
-        additionalConstraints,
+        taskType,
         clarifications,
-        retrievedSources
+        retrievedContext
       );
 
-      return JSON.stringify({ status: "prompt_ready", taskType, prompt, sourcesUsed: retrievedSources });
+      const followUps = [
+        "Now write tests for the code you just wrote.",
+        "What edge cases did you not handle in that solution?",
+        "Refactor that to be more concise without losing any functionality.",
+      ];
+
+      return JSON.stringify({
+        status: "prompt_ready",
+        taskType,
+        prompt,
+        sourcesUsed,
+        resolvedProject: resolvedProject ?? "all namespaces",
+        followUps,
+      });
     } catch (err) {
       return JSON.stringify({
         status: "error",

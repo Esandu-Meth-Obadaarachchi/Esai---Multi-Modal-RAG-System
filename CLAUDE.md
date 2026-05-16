@@ -34,14 +34,18 @@ app/
   api/projects/route.ts          — GET list of named Pinecone namespaces (force-dynamic + noStore)
   api/history/route.ts           — GET conversation list, POST save/append conversation
   api/history/[id]/route.ts      — GET single conversation, DELETE conversation
+  api/prompt-builder/route.ts    — POST with phase="detect" (Gemini generates questions) or
+                                   phase="build" (resolve project → Pinecone → Gemini writes prompt)
   chat/page.tsx                  — Chat page (server, auth-gated)
   chat/ChatClient.tsx            — Full chat UI: history sidebar, project dropdown, source panel,
                                    markdown rendering, collapsible agent steps
   upload/page.tsx                — Upload page (server, auth-gated)
   upload/UploadClient.tsx        — Upload UI: project dropdown (existing + new), uploads table
+  prompt-builder/page.tsx        — Prompt Builder page (server, auth-gated)
+  prompt-builder/PromptBuilderClient.tsx — 3-phase UI: Describe → Clarify → Prompt Ready
 
 components/
-  Navbar.tsx                     — Top nav with Chat/Upload/Sign Out
+  Navbar.tsx                     — Top nav with Chat/Upload/Prompt Builder/Sign Out
   MessageBubble.tsx              — Single message with agent steps
   SourcePanel.tsx                — Right sidebar showing retrieved chunks with scores
   AgentSteps.tsx                 — Collapsible reasoning steps
@@ -65,6 +69,11 @@ lib/
   langchain/agent.ts             — runESAIAgent(question, context, project) — native Gemini function-calling
                                    loop (up to 5 iterations). Calls tools via tool.invoke(), builds
                                    multi-turn contents array, returns { answer, agentSteps }.
+  langchain/tools/build-prompt.ts — Prompt Builder logic: detectTaskType() (regex), generateClarifyingQuestions()
+                                   (Gemini decides what's missing), resolveProject() (case-insensitive namespace
+                                   match from answers+input+filter), generatePromptWithGemini() (Gemini writes
+                                   the actual prompt using retrieved Pinecone context), buildPromptTool
+                                   (DynamicStructuredTool: resolve → embed → query 8 chunks → write prompt)
 
 types/index.ts                   — VectorMetadata, ChatMessage, RetrievedChunk, IngestResponse, etc.
 ```
@@ -132,6 +141,28 @@ POST /api/chat
            → return { answer, sources, agentSteps }
 ```
 
+## Prompt Builder Flow
+
+```
+POST /api/prompt-builder  (phase="detect")
+  │
+  └─ detectTaskType(rawInput) → regex classification (feature/bugfix/architecture/...)
+     generateClarifyingQuestions(rawInput, taskType) → Gemini decides what's missing → string[]
+     Return { taskType, questions }
+     If questions.length === 0 → client skips clarify phase, calls build immediately
+
+POST /api/prompt-builder  (phase="build")
+  │
+  └─ resolveProject(rawInput, clarifications, projectFilter)
+       → case-insensitive match against listProjects() namespaces
+       → returns exact namespace name or undefined (all namespaces)
+     embedQuery(rawInput + additionalConstraints)
+     queryPinecone(vector, 8, resolvedProject) → 8 most relevant chunks
+     generatePromptWithGemini(rawInput, taskType, clarifications, retrievedContext)
+       → Gemini writes specific Claude Code prompt using real file paths from context
+     Return { status, taskType, prompt, sourcesUsed, resolvedProject, followUps }
+```
+
 ## Chat Namespace Routing
 
 The `/api/chat` route handles three cases:
@@ -161,6 +192,10 @@ The `/api/chat` route handles three cases:
 - Markdown rendering in assistant messages (react-markdown + remark-gfm)
 - Conversational intent check — greetings/one-liners skip Pinecone entirely
 - Agent reasoning steps shown in collapsible UI under each assistant message
+- **Prompt Builder** — 3-phase tool at `/prompt-builder`: describe rough idea → Gemini asks only necessary
+  clarifying questions → retrieves real project context from Pinecone (8 chunks) → Gemini writes a specific,
+  immediately-usable Claude Code prompt referencing actual file paths and patterns. Skips clarify phase
+  automatically if no questions needed. Shows resolved namespace, sources used, and follow-up suggestions.
 
 ## Running Locally
 
@@ -188,3 +223,6 @@ Login at `/login` → redirects to `/chat`. Upload at `/upload`.
 - **Native Gemini function calling, not LangChain agents** — `createOpenAIFunctionsAgent` and `createToolCallingAgent` both fail with Gemini because LangChain's output parsers don't correctly translate Gemini's `{"functionCall":{...}}` wire format. The agent loop in `lib/langchain/agent.ts` uses `@google/genai` directly and calls `tool.invoke()` on the LangChain DynamicStructuredTools manually.
 - **LangChain used for tools only** — `DynamicStructuredTool` from `@langchain/core` is kept for the Pinecone query logic and zod schema validation. The agent orchestration loop is custom.
 - **gemini-2.5-flash-lite model** — used consistently in both `gemini.ts` and `lib/langchain/agent.ts`. Do NOT use `gemini-2.0-flash` — its free tier quota is exhausted.
+- **Prompt Builder project resolution** — `resolveProject()` in `build-prompt.ts` scans all clarification answers + raw input against actual Pinecone namespace names (case-insensitive). The explicit project filter field takes priority, then text scanning. This is why project names mentioned in answers correctly resolve to the right namespace (e.g. "esai" in an answer matches the "ESAI" namespace).
+- **Prompt Builder: Gemini generates clarifying questions** — `generateClarifyingQuestions()` calls Gemini with the raw request and task type; Gemini decides what specific information is missing. Returns `[]` if the request is self-contained, which auto-skips the clarify phase. Max 3 questions; avoids asking about things already in CLAUDE.md.
+- **Prompt Builder: Gemini writes the prompt** — `generatePromptWithGemini()` passes the retrieved Pinecone context to Gemini and instructs it to write a specific prompt referencing actual file paths and patterns. The output notes that Claude Code has CLAUDE.md open rather than repeating that documentation.

@@ -14,6 +14,8 @@ interface BuildState {
   projectFilter: string;
   prompt: string;
   sourcesUsed: string[];
+  resolvedProject: string;
+  followUps: string[];
 }
 
 const TASK_TYPE_COLOURS: Record<string, string> = {
@@ -26,45 +28,28 @@ const TASK_TYPE_COLOURS: Record<string, string> = {
   unknown: "bg-gray-500/20 text-gray-300 border-gray-500/30",
 };
 
-const SEPARATOR = "─".repeat(48);
+const EMPTY_STATE: BuildState = {
+  rawInput: "",
+  taskType: "",
+  questions: [],
+  answers: {},
+  projectFilter: "",
+  prompt: "",
+  sourcesUsed: [],
+  resolvedProject: "",
+  followUps: [],
+};
 
 export default function PromptBuilderClient() {
   const [phase, setPhase] = useState<Phase>("input");
   const [loading, setLoading] = useState(false);
+  const [loadingLabel, setLoadingLabel] = useState("");
   const [copied, setCopied] = useState(false);
   const [error, setError] = useState("");
+  const [state, setState] = useState<BuildState>(EMPTY_STATE);
 
-  const [state, setState] = useState<BuildState>({
-    rawInput: "",
-    taskType: "",
-    questions: [],
-    answers: {},
-    projectFilter: "",
-    prompt: "",
-    sourcesUsed: [],
-  });
-
-  async function handleDetect() {
-    if (!state.rawInput.trim()) return;
-    setLoading(true);
-    setError("");
-    try {
-      const res = await fetch("/api/prompt-builder", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ rawInput: state.rawInput, phase: "detect" }),
-      });
-      const data = await res.json() as { taskType: string; questions: string[] };
-      setState((s) => ({ ...s, taskType: data.taskType, questions: data.questions }));
-      setPhase("clarify");
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Something went wrong");
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  async function handleBuild() {
+  async function callBuild(rawInput: string, taskType: string, answers: Record<string, string>) {
+    setLoadingLabel("Retrieving context and writing prompt...");
     setLoading(true);
     setError("");
     try {
@@ -72,24 +57,30 @@ export default function PromptBuilderClient() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          rawInput: state.rawInput,
-          clarifications: state.answers,
+          rawInput,
+          clarifications: answers,
           projectFilter: state.projectFilter || undefined,
           phase: "build",
         }),
       });
       const data = await res.json() as {
         status: string;
+        taskType?: string;
         prompt?: string;
         sourcesUsed?: string[];
+        resolvedProject?: string;
+        followUps?: string[];
         message?: string;
       };
 
       if (data.status === "prompt_ready" && data.prompt) {
         setState((s) => ({
           ...s,
+          taskType: taskType,
           prompt: data.prompt!,
           sourcesUsed: data.sourcesUsed ?? [],
+          resolvedProject: data.resolvedProject ?? "",
+          followUps: data.followUps ?? [],
         }));
         setPhase("result");
       } else {
@@ -99,22 +90,54 @@ export default function PromptBuilderClient() {
       setError(e instanceof Error ? e.message : "Something went wrong");
     } finally {
       setLoading(false);
+      setLoadingLabel("");
     }
   }
 
+  async function handleDetect() {
+    if (!state.rawInput.trim()) return;
+    setLoadingLabel("Analysing your request...");
+    setLoading(true);
+    setError("");
+    try {
+      const res = await fetch("/api/prompt-builder", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ rawInput: state.rawInput, phase: "detect" }),
+      });
+      const data = await res.json() as { taskType: string; questions: string[] };
+
+      setState((s) => ({ ...s, taskType: data.taskType, questions: data.questions }));
+
+      if (data.questions.length === 0) {
+        // Gemini decided no clarification needed — build immediately
+        setLoading(false);
+        await callBuild(state.rawInput, data.taskType, {});
+      } else {
+        setLoading(false);
+        setLoadingLabel("");
+        setPhase("clarify");
+      }
+    } catch (e) {
+      setLoading(false);
+      setLoadingLabel("");
+      setError(e instanceof Error ? e.message : "Something went wrong");
+    }
+  }
+
+  async function handleBuild() {
+    await callBuild(state.rawInput, state.taskType, state.answers);
+  }
+
   async function handleCopy() {
-    // Strip the ESAI header and notes — copy only the Claude-ready prompt block
-    const parts = state.prompt.split(SEPARATOR).map((s) => s.trim()).filter(Boolean);
-    // Parts: [header block, prompt, notes block] — we want index 1
-    const promptOnly = parts.length >= 2 ? parts[1] : state.prompt;
-    await navigator.clipboard.writeText(promptOnly);
+    await navigator.clipboard.writeText(state.prompt);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
   }
 
   function handleReset() {
     setPhase("input");
-    setState({ rawInput: "", taskType: "", questions: [], answers: {}, projectFilter: "", prompt: "", sourcesUsed: [] });
+    setState(EMPTY_STATE);
     setError("");
   }
 
@@ -132,17 +155,19 @@ export default function PromptBuilderClient() {
               <h1 className="text-lg font-semibold">Prompt Builder</h1>
             </div>
             <p className="text-gray-500 text-sm">
-              Describe what you want to build or fix. ESAI pulls your project context and generates an optimised Claude prompt.
+              Describe what you want to do. ESAI retrieves your real project context and writes a specific Claude prompt.
             </p>
           </div>
 
-          {/* Progress steps */}
+          {/* Progress */}
           <div className="flex items-center gap-2 mb-8 text-xs text-gray-600">
             {(["Describe", "Clarify", "Prompt Ready"] as const).map((label, i) => {
               const phaseIndex = ["input", "clarify", "result"].indexOf(phase);
               return (
                 <div key={label} className="flex items-center gap-2">
-                  <span className={`font-medium transition-colors ${i < phaseIndex ? "text-gray-500" : i === phaseIndex ? "text-white" : "text-gray-700"}`}>
+                  <span className={`font-medium transition-colors ${
+                    i < phaseIndex ? "text-gray-500" : i === phaseIndex ? "text-white" : "text-gray-700"
+                  }`}>
                     {label}
                   </span>
                   {i < 2 && <ChevronRight className="w-3 h-3 text-gray-700" />}
@@ -167,11 +192,13 @@ export default function PromptBuilderClient() {
               </div>
 
               <div>
-                <label className="block text-sm text-gray-400 mb-2">Project filter <span className="text-gray-600">(optional — narrows context retrieval)</span></label>
+                <label className="block text-sm text-gray-400 mb-2">
+                  Project filter <span className="text-gray-600">(optional — helps retrieve the right context)</span>
+                </label>
                 <input
                   type="text"
                   className="w-full bg-gray-900 border border-gray-800 rounded-xl p-3 text-sm text-white placeholder-gray-600 focus:outline-none focus:border-gray-600 transition-colors"
-                  placeholder="e.g. ESAI, PowerProx, PowerZenith..."
+                  placeholder="e.g. ESAI, PowerProx..."
                   value={state.projectFilter}
                   onChange={(e) => setState((s) => ({ ...s, projectFilter: e.target.value }))}
                 />
@@ -187,12 +214,11 @@ export default function PromptBuilderClient() {
                 className="w-full bg-blue-600 hover:bg-blue-500 disabled:opacity-40 disabled:cursor-not-allowed text-white rounded-xl py-3 text-sm font-semibold transition-colors flex items-center justify-center gap-2"
               >
                 {loading ? (
-                  <><Loader2 className="w-4 h-4 animate-spin" /> Analysing...</>
+                  <><Loader2 className="w-4 h-4 animate-spin" />{loadingLabel || "Thinking..."}</>
                 ) : (
                   <>Continue <ChevronRight className="w-4 h-4" /></>
                 )}
               </button>
-
               <p className="text-gray-700 text-xs text-center">⌘ + Enter to continue</p>
             </div>
           )}
@@ -200,17 +226,19 @@ export default function PromptBuilderClient() {
           {/* Phase 2 — Clarify */}
           {phase === "clarify" && (
             <div className="space-y-5">
-              <div className="flex items-center gap-3 mb-2">
+              <div className="flex items-center gap-3">
                 <span className={`text-xs px-2 py-1 rounded border font-medium ${TASK_TYPE_COLOURS[state.taskType] ?? TASK_TYPE_COLOURS.unknown}`}>
                   {state.taskType.toUpperCase()}
                 </span>
-                <span className="text-gray-500 text-sm">Answer these to build a precise prompt.</span>
+                <span className="text-gray-500 text-sm">
+                  {state.questions.length === 1 ? "One quick question:" : `${state.questions.length} questions to sharpen the prompt:`}
+                </span>
               </div>
 
               {state.questions.map((question, i) => (
                 <div key={i}>
                   <label className="block text-sm text-gray-300 mb-2">
-                    {i + 1}. {question}
+                    {state.questions.length > 1 ? `${i + 1}. ` : ""}{question}
                   </label>
                   <textarea
                     className="w-full bg-gray-900 border border-gray-800 rounded-xl p-3 text-sm text-white placeholder-gray-600 resize-none focus:outline-none focus:border-gray-600 transition-colors"
@@ -244,7 +272,7 @@ export default function PromptBuilderClient() {
                   className="flex-1 bg-blue-600 hover:bg-blue-500 disabled:opacity-40 disabled:cursor-not-allowed text-white rounded-xl py-3 text-sm font-semibold transition-colors flex items-center justify-center gap-2"
                 >
                   {loading ? (
-                    <><Loader2 className="w-4 h-4 animate-spin" /> Building prompt...</>
+                    <><Loader2 className="w-4 h-4 animate-spin" />{loadingLabel || "Building prompt..."}</>
                   ) : (
                     <>Build Prompt <Zap className="w-4 h-4" /></>
                   )}
@@ -255,10 +283,24 @@ export default function PromptBuilderClient() {
 
           {/* Phase 3 — Result */}
           {phase === "result" && (
-            <div className="space-y-4">
+            <div className="space-y-5">
+
+              {/* Meta info */}
+              <div className="flex flex-wrap items-center gap-2">
+                <span className={`text-xs px-2 py-1 rounded border font-medium ${TASK_TYPE_COLOURS[state.taskType] ?? TASK_TYPE_COLOURS.unknown}`}>
+                  {state.taskType.toUpperCase()}
+                </span>
+                {state.resolvedProject && state.resolvedProject !== "all namespaces" && (
+                  <span className="text-xs px-2 py-1 bg-gray-900 border border-gray-800 rounded text-gray-400">
+                    namespace: {state.resolvedProject}
+                  </span>
+                )}
+              </div>
+
+              {/* Sources */}
               {state.sourcesUsed.length > 0 && (
                 <div className="flex flex-wrap items-center gap-2">
-                  <span className="text-xs text-gray-600">Sources used:</span>
+                  <span className="text-xs text-gray-600 shrink-0">Context from:</span>
                   {state.sourcesUsed.map((s) => (
                     <span key={s} className="text-xs px-2 py-0.5 bg-gray-900 border border-gray-800 rounded text-gray-500">
                       {s}
@@ -267,10 +309,12 @@ export default function PromptBuilderClient() {
                 </div>
               )}
 
-              <pre className="bg-gray-900 border border-gray-800 rounded-xl p-4 text-xs text-gray-300 overflow-auto max-h-[60vh] whitespace-pre-wrap font-mono leading-relaxed">
+              {/* Prompt output */}
+              <pre className="bg-gray-900 border border-gray-800 rounded-xl p-4 text-xs text-gray-300 overflow-auto max-h-[55vh] whitespace-pre-wrap font-mono leading-relaxed">
                 {state.prompt}
               </pre>
 
+              {/* Actions */}
               <div className="flex gap-3">
                 <button
                   onClick={handleReset}
@@ -283,16 +327,28 @@ export default function PromptBuilderClient() {
                   className="flex-1 bg-blue-600 hover:bg-blue-500 text-white rounded-xl py-3 text-sm font-semibold transition-colors flex items-center justify-center gap-2"
                 >
                   {copied ? (
-                    <><Check className="w-4 h-4" /> Copied to Clipboard</>
+                    <><Check className="w-4 h-4" /> Copied</>
                   ) : (
-                    <><Copy className="w-4 h-4" /> Copy Prompt (Claude-Ready)</>
+                    <><Copy className="w-4 h-4" /> Copy Prompt</>
                   )}
                 </button>
               </div>
 
-              <p className="text-gray-700 text-xs text-center">
-                Only the Claude prompt is copied — the ESAI notes at the bottom are excluded.
-              </p>
+              {/* Follow-up suggestions */}
+              {state.followUps.length > 0 && (
+                <div className="border-t border-gray-800 pt-4">
+                  <p className="text-xs text-gray-600 mb-2">Likely follow-up prompts after Claude responds:</p>
+                  <ol className="space-y-1">
+                    {state.followUps.map((f, i) => (
+                      <li key={i} className="text-xs text-gray-500 flex gap-2">
+                        <span className="text-gray-700 shrink-0">{i + 1}.</span>
+                        <span>&quot;{f}&quot;</span>
+                      </li>
+                    ))}
+                  </ol>
+                </div>
+              )}
+
             </div>
           )}
 

@@ -1,7 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getServerSession } from "next-auth";
 import { authOptions } from "@/lib/auth";
-import { buildPromptTool, detectTaskType, CLARIFYING_QUESTIONS } from "@/lib/langchain/tools/build-prompt";
+import {
+  buildPromptTool,
+  detectTaskType,
+  generateClarifyingQuestions,
+} from "@/lib/langchain/tools/build-prompt";
 
 export async function POST(req: NextRequest) {
   const session = await getServerSession(authOptions);
@@ -21,7 +25,8 @@ export async function POST(req: NextRequest) {
 
     if (phase === "detect") {
       const taskType = detectTaskType(rawInput);
-      const questions = CLARIFYING_QUESTIONS[taskType];
+      // Gemini decides what's actually missing from this specific request
+      const questions = await generateClarifyingQuestions(rawInput, taskType);
       return NextResponse.json({ taskType, questions });
     }
 
@@ -35,8 +40,11 @@ export async function POST(req: NextRequest) {
 
       const parsed = JSON.parse(result) as {
         status: string;
+        taskType?: string;
         prompt?: string;
         sourcesUsed?: string[];
+        resolvedProject?: string;
+        followUps?: string[];
         message?: string;
       };
       return NextResponse.json(parsed);
