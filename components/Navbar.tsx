@@ -23,6 +23,12 @@ export default function Navbar() {
         >
           Upload
         </Link>
+        <Link
+          href="/prompt-builder"
+          className={`text-sm transition ${pathname === "/prompt-builder" ? "text-white" : "text-gray-400 hover:text-white"}`}
+        >
+          Prompt Builder
+        </Link>
         <button
           onClick={() => signOut({ callbackUrl: "/login" })}
           className="text-sm text-gray-400 hover:text-red-400 transition"
