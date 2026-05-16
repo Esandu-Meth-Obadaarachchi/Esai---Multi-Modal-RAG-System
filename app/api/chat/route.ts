@@ -1,10 +1,17 @@
 import { NextRequest, NextResponse } from "next/server";
 import { embedQuery, generateResponse } from "@/lib/gemini";
 import { getPineconeIndex, getPineconeNamespace, listProjects } from "@/lib/pinecone";
-import { buildPersonaPrompt } from "@/lib/persona";
+import { runESAIAgent } from "@/lib/langchain/agent";
 import type { RetrievedChunk } from "@/types";
 
-// Ask Gemini which namespaces are most relevant for a given question
+// Greetings and one-liners that never need document retrieval
+const CONVERSATIONAL = /^(hi|hello|hey|thanks|thank you|ok|okay|sure|yes|no|good|great|cool|bye|goodbye|sup|what can you do|who are you|what are you|what's up|how are you|nice|awesome|perfect|got it|alright|noted)[\s!?.]*$/i;
+
+function isConversational(question: string): boolean {
+  return CONVERSATIONAL.test(question.trim());
+}
+
+
 async function resolveNamespaces(question: string, allProjects: string[]): Promise<string[]> {
   if (allProjects.length === 0) return [];
   if (allProjects.length === 1) return allProjects;
@@ -21,9 +28,7 @@ Which 1-3 projects are most relevant to this question? Reply with ONLY the proje
 
   if (text === "all") return allProjects;
 
-  const picked = allProjects.filter((p) =>
-    text.includes(p.toLowerCase())
-  );
+  const picked = allProjects.filter((p) => text.includes(p.toLowerCase()));
   return picked.length > 0 ? picked : allProjects;
 }
 
@@ -42,21 +47,26 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "No question provided" }, { status: 400 });
     }
 
+    // Skip Pinecone entirely for conversational messages
+    if (isConversational(question)) {
+      const { answer } = await runESAIAgent(question, "No documents needed for this message.", project);
+      return NextResponse.json({ answer, sources: [], agentSteps: [] });
+    }
+
+    // Embed + retrieve
     const questionEmbedding = await embedQuery(question);
     let matches: Awaited<ReturnType<typeof queryNamespace>> = [];
 
     if (project !== "auto") {
-      // Query specific namespace
-      const ns = getPineconeNamespace(project);
-      matches = await queryNamespace(ns, questionEmbedding, 5);
+      matches = await queryNamespace(getPineconeNamespace(project), questionEmbedding, 5);
     } else {
-      // Smart routing — let Gemini decide which namespaces to search
       const allProjects = await listProjects();
 
       if (allProjects.length === 0) {
-        // No namespaces yet — fall back to default namespace
         const result = await getPineconeIndex().query({
-          vector: questionEmbedding, topK: 5, includeMetadata: true,
+          vector: questionEmbedding,
+          topK: 5,
+          includeMetadata: true,
         });
         matches = result.matches ?? [];
       } else {
@@ -67,7 +77,6 @@ export async function POST(req: NextRequest) {
           targetProjects.map((p) => queryNamespace(getPineconeNamespace(p), questionEmbedding, perNs))
         );
 
-        // Merge and sort by score descending, take top 5
         matches = results
           .flat()
           .sort((a, b) => (b.score ?? 0) - (a.score ?? 0))
@@ -90,10 +99,9 @@ export async function POST(req: NextRequest) {
             .join("\n\n")
         : "No relevant documents found.";
 
-    const fullPrompt = `${buildPersonaPrompt(context)}\n\nQuestion: ${question}`;
-    const answer = await generateResponse(fullPrompt);
+    const { answer, agentSteps } = await runESAIAgent(question, context, project);
 
-    return NextResponse.json({ answer, sources, agentSteps: [] });
+    return NextResponse.json({ answer, sources, agentSteps });
   } catch (err) {
     console.error("[chat] error:", err);
     const message = err instanceof Error ? err.message : "Unknown error";

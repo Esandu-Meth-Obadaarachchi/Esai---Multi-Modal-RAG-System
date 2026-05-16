@@ -12,10 +12,11 @@ Users upload documents (PDF, DOCX, images, code, markdown) → stored as vectors
 | Framework | Next.js 14.2.0, App Router, TypeScript |
 | Styling | Tailwind CSS |
 | Vector DB | Pinecone (`esai` index, 3072 dims, cosine, per-project namespaces) |
-| LLM | Gemini 2.5 Flash Lite |
+| LLM | Gemini 2.5 Flash Lite (`gemini-2.5-flash-lite`) |
 | Embeddings | gemini-embedding-2-preview (3072-dim) via `@google/genai` |
 | Image understanding | Gemini Vision → text description → embed |
-| Agent framework | LangChain.js (`langchain`, `@langchain/google-genai`, `@langchain/core`) |
+| Agent framework | Native Gemini function calling via `@google/genai` SDK (NOT LangChain agents) |
+| Tool definitions | LangChain `DynamicStructuredTool` used for tool logic only — NOT for agent orchestration |
 | Document parsing | pdf-parse (PDFs), mammoth (DOCX), raw Buffer (text/code/markdown) |
 | Auth | NextAuth.js v4, credentials provider, 2 hardcoded users |
 | Chat history | MongoDB Atlas (free M0), `mongodb` driver |
@@ -27,13 +28,15 @@ Users upload documents (PDF, DOCX, images, code, markdown) → stored as vectors
 app/
   (auth)/login/page.tsx          — Login form
   api/auth/[...nextauth]/        — NextAuth handler
-  api/chat/route.ts              — Chat: embed query → namespace routing → Gemini Flash
+  api/chat/route.ts              — Chat: conversational check → embed → namespace routing →
+                                   runESAIAgent() → answer + agentSteps + sources
   api/ingest/route.ts            — Ingest: parse → chunk → embed → Pinecone namespace upsert
-  api/projects/route.ts          — GET list of named Pinecone namespaces
+  api/projects/route.ts          — GET list of named Pinecone namespaces (force-dynamic + noStore)
   api/history/route.ts           — GET conversation list, POST save/append conversation
   api/history/[id]/route.ts      — GET single conversation, DELETE conversation
   chat/page.tsx                  — Chat page (server, auth-gated)
-  chat/ChatClient.tsx            — Full chat UI: history sidebar, project dropdown, source panel, markdown rendering
+  chat/ChatClient.tsx            — Full chat UI: history sidebar, project dropdown, source panel,
+                                   markdown rendering, collapsible agent steps
   upload/page.tsx                — Upload page (server, auth-gated)
   upload/UploadClient.tsx        — Upload UI: project dropdown (existing + new), uploads table
 
@@ -56,9 +59,12 @@ lib/
   parsers/docx.ts                — mammoth wrapper
   parsers/image.ts               — calls describeImage() from gemini.ts
   parsers/text.ts                — raw Buffer → string
-  langchain/tools.ts             — 4 tools: search_documents, cross_reference_projects,
-                                   summarise_project, compare_approaches (all use embedQuery)
-  langchain/agent.ts             — createESAIAgent() using createOpenAIFunctionsAgent
+  langchain/tools.ts             — createTools(defaultProject) factory — returns 4 DynamicStructuredTools:
+                                   search_documents, cross_reference_projects, summarise_project,
+                                   compare_approaches. All query per-project Pinecone namespaces.
+  langchain/agent.ts             — runESAIAgent(question, context, project) — native Gemini function-calling
+                                   loop (up to 5 iterations). Calls tools via tool.invoke(), builds
+                                   multi-turn contents array, returns { answer, agentSteps }.
 
 types/index.ts                   — VectorMetadata, ChatMessage, RetrievedChunk, IngestResponse, etc.
 ```
@@ -108,6 +114,24 @@ Each conversation document:
 }
 ```
 
+## Chat Flow (Phase 5 — current)
+
+```
+POST /api/chat
+  │
+  ├─ isConversational("Hi"?) → YES → runESAIAgent(no context) → return answer, no sources
+  │
+  └─ NO → embedQuery(question)
+           → namespace routing (specific project OR Gemini picks 1-3 auto namespaces)
+           → Pinecone query → sources + context string
+           → runESAIAgent(question, context, project)
+                 │
+                 ├─ Gemini receives question + context in system prompt + 4 tool declarations
+                 ├─ If Gemini calls a tool → execute via tool.invoke() → feed result back → repeat
+                 └─ When Gemini returns text → { answer, agentSteps }
+           → return { answer, sources, agentSteps }
+```
+
 ## Chat Namespace Routing
 
 The `/api/chat` route handles three cases:
@@ -124,7 +148,7 @@ The `/api/chat` route handles three cases:
 | 2 — Ingestion | **Done** | `/api/ingest`: parse → chunk → embed → Pinecone namespace upsert + Upload UI |
 | 3 — RAG Chat | **Done** | `/api/chat`: embed query → namespace routing → Gemini Flash + Chat UI |
 | 4 — Multimodal | **Done** | Image pipeline with Gemini Vision (part of ingest) |
-| 5 — Agent | Pending | LangChain agent + 4 tools wired into chat route |
+| 5 — Agent | **Done** | Native Gemini function-calling loop with 4 tools, agentSteps surfaced in UI |
 | 6 — Evaluation | Pending | 20 Q&A test set, retrieval recall/correctness/faithfulness |
 | 7 — AWS + CI/CD | Pending | EC2 + Nginx + PM2 + GitHub Actions |
 
@@ -135,6 +159,8 @@ The `/api/chat` route handles three cases:
 - Project dropdown on chat page — same live fetch, with "Auto" as default
 - Chat history sidebar backed by MongoDB Atlas (load, delete conversations)
 - Markdown rendering in assistant messages (react-markdown + remark-gfm)
+- Conversational intent check — greetings/one-liners skip Pinecone entirely
+- Agent reasoning steps shown in collapsible UI under each assistant message
 
 ## Running Locally
 
@@ -158,3 +184,7 @@ Login at `/login` → redirects to `/chat`. Upload at `/upload`.
 - **Pinecone namespace = project name** — namespace names are the source of truth for the project list; no separate DB table needed.
 - **MongoDB optional** — if `MONGODB_URI` is missing, the app still runs; history API calls fail silently.
 - **`__default__` filtered from project list** — Pinecone's internal default namespace name is excluded from dropdowns alongside the empty string namespace.
+- **`/api/projects` is force-dynamic + noStore** — `export const dynamic = "force-dynamic"` and `noStore()` prevent Next.js from caching the namespace list. Without both, deleted/added namespaces won't appear until server restart.
+- **Native Gemini function calling, not LangChain agents** — `createOpenAIFunctionsAgent` and `createToolCallingAgent` both fail with Gemini because LangChain's output parsers don't correctly translate Gemini's `{"functionCall":{...}}` wire format. The agent loop in `lib/langchain/agent.ts` uses `@google/genai` directly and calls `tool.invoke()` on the LangChain DynamicStructuredTools manually.
+- **LangChain used for tools only** — `DynamicStructuredTool` from `@langchain/core` is kept for the Pinecone query logic and zod schema validation. The agent orchestration loop is custom.
+- **gemini-2.5-flash-lite model** — used consistently in both `gemini.ts` and `lib/langchain/agent.ts`. Do NOT use `gemini-2.0-flash` — its free tier quota is exhausted.

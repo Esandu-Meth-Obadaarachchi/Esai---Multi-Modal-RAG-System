@@ -95,7 +95,7 @@ export default function ChatClient() {
 
       const data = await res.json();
       const newAssistantMsg: ChatMessage = res.ok
-        ? { role: "assistant", content: data.answer, sources: data.sources, agentSteps: data.agentSteps }
+        ? { role: "assistant", content: typeof data.answer === "string" ? data.answer : String(data.answer ?? ""), sources: data.sources, agentSteps: data.agentSteps }
         : { role: "assistant", content: `Error: ${data.error ?? "Something went wrong"}` };
 
       setMessages((prev) => [...prev, newAssistantMsg]);
